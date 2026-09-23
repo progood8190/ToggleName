@@ -1,217 +1,179 @@
 (function () {
   'use strict';
-
-  if (window.DeflyNameToggle && window.DeflyNameToggle.destroy) {
-    try { window.DeflyNameToggle.destroy(); } catch (e) {}
-  }
+  if (window.DeflyNameToggle && window.DeflyNameToggle.destroy) { try { window.DeflyNameToggle.destroy(); } catch (e) {} }
 
   var state = 'vanilla';
-  var myCopter = null;
-  var pinned = [];
-  var rafId = 0;
-  var guessId = -1, guessFrames = 0;
+  var players = null;
+  var ownId = null;
+  var mine = null;
+  var expectOwn = false;
+  var pinned = [], rafId = 0;
 
-  var players = null, pixiPatched = false, origAddChild = null;
+  var hunting = false, hooks = [], roots = [], cleared = [], clearQueued = false, searchTick = 0;
+
+  function has(o, k) { return Object.prototype.hasOwnProperty.call(o, k); }
+  function isCopter(c) { return !!c && c.playerId != null && c.playerId !== '' && Number(c.playerId) >= 0; }
+  function sameId(a, b) { return a != null && b != null && Number(a) === Number(b); }
 
   function pin(obj, prop, value) {
-    if (!obj) return;
-    var slot = '__dnt_' + prop;
-    if (Object.prototype.hasOwnProperty.call(obj, slot)) { obj[slot] = value; return; }
+    var slot = '__dnt_' + prop, want = '__dnt_orig_' + prop;
+    if (has(obj, slot)) { obj[slot] = value; return; }
     var current = obj[prop];
-    Object.defineProperty(obj, slot, {
-      value: value, writable: true, configurable: true, enumerable: false
-    });
-    Object.defineProperty(obj, '__dnt_orig_' + prop, {
-      value: current, writable: true, configurable: true, enumerable: false
-    });
-    Object.defineProperty(obj, prop, {
-      configurable: true,
-      enumerable: true,
+    Object.defineProperty(obj, slot, { value: value, writable: true, configurable: true });
+    Object.defineProperty(obj, want, { value: current, writable: true, configurable: true });
+    Object.defineProperty(obj, prop, { configurable: true, enumerable: true,
       get: function () { return this[slot]; },
-      set: function () {  }
-    });
+      set: function (v) { this[want] = v; } });
     if (pinned.indexOf(obj) === -1) pinned.push(obj);
   }
-
   function unpin(obj, prop) {
-    if (!obj) return;
-    var slot = '__dnt_' + prop;
-    if (!Object.prototype.hasOwnProperty.call(obj, slot)) return;
-    var restore = obj['__dnt_orig_' + prop];
-    delete obj[prop];
-    delete obj[slot];
-    delete obj['__dnt_orig_' + prop];
+    var slot = '__dnt_' + prop, want = '__dnt_orig_' + prop;
+    if (!has(obj, slot)) return;
+    var restore = obj[want];
+    delete obj[prop]; delete obj[slot]; delete obj[want];
     try { obj[prop] = restore; } catch (e) {}
   }
-
   function releaseAll() {
-    for (var i = 0; i < pinned.length; i++) {
-      unpin(pinned[i], 'alpha');
-      unpin(pinned[i], 'visible');
-    }
+    for (var i = 0; i < pinned.length; i++) { unpin(pinned[i], 'alpha'); unpin(pinned[i], 'visible'); }
     pinned.length = 0;
   }
 
-  function rootOf(n) { var g = 0; while (n && n.parent && g++ < 128) n = n.parent; return n; }
-
-  function findPlayersContainer(root) {
-    if (!root || !root.children) return null;
-    for (var i = 0; i < root.children.length; i++) {
-      var c = root.children[i];
-      if (!c || !c.children || !c.children.length) continue;
-      for (var j = 0; j < c.children.length; j++) {
-        if (c.children[j] && typeof c.children[j].playerId === 'number') return c;
+  function hook(obj, key, make) {
+    var own = has(obj, key), orig = obj[key], wrapper = make(orig);
+    obj[key] = wrapper;
+    hooks.push({ obj: obj, key: key, own: own, orig: orig, wrapper: wrapper });
+  }
+  function unhookAll() {
+    for (var i = hooks.length - 1; i >= 0; i--) {
+      var h = hooks[i];
+      if (h.obj[h.key] !== h.wrapper) continue;
+      if (h.own) h.obj[h.key] = h.orig; else delete h.obj[h.key];
+    }
+    hooks.length = 0;
+  }
+  function markCleared(c) {
+    cleared.push(c);
+    if (!clearQueued) { clearQueued = true; Promise.resolve().then(function () { cleared.length = 0; clearQueued = false; }); }
+  }
+  function startHunt() {
+    if (hunting || players || !window.PIXI || !window.PIXI.Container) return;
+    hunting = true;
+    var C = window.PIXI.Container.prototype;
+    hook(C, 'addChild', function (orig) {
+      return function (child) {
+        var res = orig.apply(this, arguments);
+        if (!players && arguments.length === 1 && child && typeof child.playerId === 'number' && child.playerId >= 0) {
+          try { adopt(this, cleared.indexOf(this) !== -1 ? child : null); } catch (e) {}
+        }
+        return res;
+      };
+    });
+    hook(C, 'removeChildren', function (orig) {
+      return function () { var res = orig.apply(this, arguments); if (!players) markCleared(this); return res; };
+    });
+    [window.PIXI.WebGLRenderer, window.PIXI.CanvasRenderer].forEach(function (R) {
+      if (!R || !R.prototype || typeof R.prototype.render !== 'function') return;
+      hook(R.prototype, 'render', function (orig) {
+        return function (root) {
+          if (!players && root && roots.length < 8 && roots.indexOf(root) === -1) roots.push(root);
+          return orig.apply(this, arguments);
+        };
+      });
+    });
+  }
+  function stopHunt() { unhookAll(); hunting = false; roots.length = 0; }
+  function searchLayer() {
+    if (!roots.length || ++searchTick % 10) return;
+    for (var r = 0; r < roots.length; r++) {
+      var layers = roots[r].children || [];
+      for (var i = 0; i < layers.length; i++) {
+        var k = layers[i] && layers[i].children; if (!k) continue;
+        for (var j = 0; j < k.length; j++) if (isCopter(k[j]) && k[j].usernameText) { adopt(layers[i], null); return; }
       }
     }
-    return null;
   }
 
-  function patchPixi() {
-    if (pixiPatched || !window.PIXI || !window.PIXI.Container) return;
-    var proto = window.PIXI.Container.prototype;
-    origAddChild = proto.addChild;
-    proto.addChild = function () {
-      var res = origAddChild.apply(this, arguments);
-      try {
-        var child = arguments[0];
-        if (child && typeof child.playerId === 'number' && child.playerId >= 0) {
-          players = this;
-          unpatchPixi();
-        } else if (!players) {
-          var pc = findPlayersContainer(rootOf(this));
-          if (pc) { players = pc; unpatchPixi(); }
-        }
-      } catch (e) {}
+  function adopt(layer, own) {
+    players = layer; stopHunt();
+    var baseAdd = layer.addChild, baseClear = layer.removeChildren;
+    layer.addChild = function (child) {
+      var res = baseAdd.apply(this, arguments);
+      if (expectOwn && arguments.length === 1 && isCopter(child)) { expectOwn = false; ownId = child.playerId; }
       return res;
     };
-    pixiPatched = true;
+    layer.removeChildren = function () {
+      var res = baseClear.apply(this, arguments);
+      releaseAll(); mine = null; ownId = null; expectOwn = true;
+      Promise.resolve().then(function () { expectOwn = false; });
+      return res;
+    };
+    if (own) ownId = own.playerId;
   }
 
-  function unpatchPixi() {
-    if (!pixiPatched) return;
-    try { window.PIXI.Container.prototype.addChild = origAddChild; } catch (e) {}
-    pixiPatched = false;
-  }
-
-  function detectMine() {
-    if (!players) return null;
-    var kids = players.children, i, c;
-
-    for (i = 0; i < kids.length; i++) {
-      c = kids[i];
-      if (!c || typeof c.playerId !== 'number' || c.playerId < 0) continue;
+  function findMine() {
+    var kids = players.children, byId = null;
+    for (var i = 0; i < kids.length; i++) {
+      var c = kids[i]; if (!isCopter(c)) continue;
       var t = c.usernameText;
-      if (t && !Object.prototype.hasOwnProperty.call(t, '__dnt_alpha') && t.alpha < 0.999) {
-        guessFrames = 0;
-        return c;
-      }
+      if (t && !has(t, '__dnt_alpha') && t.alpha < 0.999) return c;
+      if (!byId && sameId(c.playerId, ownId)) byId = c;
     }
-
-    var wt = players.worldTransform;
-    if (!wt) return null;
-    var cx = window.innerWidth / 2, cy = window.innerHeight / 2;
-    var best = null, bestD = Infinity;
-    for (i = 0; i < kids.length; i++) {
-      c = kids[i];
-      if (!c || typeof c.playerId !== 'number' || c.playerId < 0) continue;
-      if (c.visible === false) continue;
-      var sx = wt.a * c.x + wt.c * c.y + wt.tx;
-      var sy = wt.b * c.x + wt.d * c.y + wt.ty;
-      var d = (sx - cx) * (sx - cx) + (sy - cy) * (sy - cy);
-      if (d < bestD) { bestD = d; best = c; }
-    }
-    if (!best || bestD > 80 * 80) { guessFrames = 0; return null; }
-    if (best.playerId === guessId) guessFrames++;
-    else { guessId = best.playerId; guessFrames = 1; }
-    return guessFrames >= 20 ? best : null;
+    return byId;
   }
+  function playing() { return !!(mine && mine.parent === players && mine.visible !== false); }
 
   function apply() {
-    if (state === 'vanilla' || !myCopter) return;
-    var on = (state === 'shown');
-    var t = myCopter.usernameText;
+    var on = state === 'shown', t = mine.usernameText, b = mine.badge;
     if (t) { pin(t, 'alpha', on ? 1 : 0); pin(t, 'visible', on); }
-    var b = myCopter.badge;
     if (b) { pin(b, 'alpha', on ? 1 : 0); pin(b, 'visible', on); }
   }
-
   function frame() {
     rafId = requestAnimationFrame(frame);
-    if (!players) { patchPixi(); return; }
-
-    if (!myCopter || !myCopter.parent) {
-      var found = detectMine();
-      if (found && found !== myCopter) {
-        releaseAll();
-        myCopter = found;
-      }
-    }
-    apply();
+    if (!players) { startHunt(); searchLayer(); return; }
+    var found = findMine();
+    if (found !== mine) { releaseAll(); mine = found; }
+    if (found) ownId = found.playerId;
+    if (playing() && state !== 'vanilla') apply();
+    else if (pinned.length) releaseAll();
   }
 
   function typing() {
-    var a = document.activeElement;
-    if (!a) return false;
+    var a = document.activeElement; if (!a) return false;
     var tag = (a.tagName || '').toUpperCase();
     return tag === 'INPUT' || tag === 'TEXTAREA' || a.isContentEditable === true;
   }
-
   function onKey(e) {
-    if (typing()) return;
-    if (e.ctrlKey || e.metaKey || e.altKey) return;
-    var hit = (e.code === 'KeyN') || (e.key && e.key.toLowerCase() === 'n');
-    if (!hit) return;
-    API.toggle();
+    if (e.repeat || typing() || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (e.code === 'KeyN' || (e.key && e.key.toLowerCase() === 'n')) API.toggle();
   }
 
   var API = {
-    show: function () {
-      state = 'shown'; apply();
-      console.log('[name-toggle] name + badge: ON');
-      return API;
+    show: function () { state = 'shown'; if (playing()) apply(); return API; },
+    hide: function () { state = 'hidden'; if (playing()) apply(); return API; },
+    toggle: function () {
+      if (!playing()) return API;
+      if (state === 'shown') return API.hide();
+      if (state === 'hidden') return API.show();
+      var t = mine.usernameText;
+      return (t && t.visible !== false && t.alpha >= 0.5) ? API.hide() : API.show();
     },
-    hide: function () {
-      state = 'hidden'; apply();
-      console.log('[name-toggle] name + badge: OFF');
-      return API;
-    },
-    toggle: function () { return state === 'shown' ? API.hide() : API.show(); },
-    release: function () {
-      state = 'vanilla'; releaseAll();
-      console.log('[name-toggle] released — back to the default fade');
-      return API;
-    },
+    release: function () { state = 'vanilla'; releaseAll(); return API; },
     status: function () {
-      console.log('[name-toggle] state:', state,
-                  '| copter found:', !!myCopter,
-                  '| id:', myCopter ? myCopter.playerId : '-',
-                  '| badge:', myCopter && myCopter.badge ? 'yes' : 'no',
-                  '| key:', 'n');
-      return { state: state, found: !!myCopter, key: 'n' };
+      return { state: state, playing: playing(), found: !!mine, id: mine ? mine.playerId : null, badge: !!(mine && mine.badge), key: 'n' };
     },
     destroy: function () {
-      if (rafId) cancelAnimationFrame(rafId);
-      rafId = 0;
+      if (rafId) cancelAnimationFrame(rafId); rafId = 0;
       window.removeEventListener('keydown', onKey, true);
-      unpatchPixi();
-      releaseAll();
-      myCopter = null;
+      stopHunt();
+      if (players) { try { delete players.addChild; delete players.removeChildren; } catch (e) {} }
+      releaseAll(); players = mine = ownId = null; expectOwn = false;
       delete window.DeflyNameToggle;
-      console.log('[name-toggle] uninstalled');
-    },
-    __test: { pin: pin, unpin: unpin, releaseAll: releaseAll, pinnedList: pinned }
+    }
   };
 
   window.DeflyNameToggle = API;
-  patchPixi();
+  startHunt();
   window.addEventListener('keydown', onKey, true);
   rafId = requestAnimationFrame(frame);
-
-  console.log(
-    '%c[name-toggle] ready%c\n' +
-    'Press N to show or hide your own name + badge.\n' +
-    'If nothing happens, spawn into a game first, then run DeflyNameToggle.status()',
-    'background:#132;color:#9f8;padding:2px 6px;border-radius:3px;font-weight:700',
-    'color:inherit'
-  );
+  console.log('[name-toggle] loaded');
 })();
